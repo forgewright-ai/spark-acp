@@ -34,8 +34,19 @@ The mode, in the client's mode picker (Toad: Ctrl-P):
     Accept     apply the diffs to the directory
     Discard    throw the copy away
 
-A step marked "can destroy data" is not run through a client: run
-`spark do` in a terminal for that one.
+A step marked "can destroy data" (or one whose effect cannot be read
+from its line) is refused outside the sandbox: run `spark do` in a
+terminal for that one. In the sandbox it runs in the copy, the diff is
+the gate, and Accept applies it. A client set to approve on its own
+answers Run and Accept without you.
+
+The review marks what a diff cannot show
+
+    +x                     an executable bit added
+    (setuid masked)        spark's reason, whatever it is
+    (control characters)   the name or the text has them (shown visibly)
+    held back, refused     listed apart, before the question, by name
+                           with the reason: never applied
 
 By example
 

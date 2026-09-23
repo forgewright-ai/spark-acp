@@ -17,8 +17,12 @@ Two modes, picked in the client:
                no network, only the copy writable -- and you accept or
                discard the diffs once, at the end
 
-A command that can destroy data runs in a terminal (`spark do`) only:
-through a client, spark refuses it and says so.
+Outside the sandbox, a command that can destroy data -- or whose
+effect cannot be read from its line -- is refused: spark says so, and
+it runs in a terminal (`spark do`) only. Inside the sandbox it runs in
+the copy, and the diff is the gate: nothing reaches the directory until
+Accept, and Accept applies the changes. A client set to approve on its
+own answers Run and Accept without you.
 
 ## Install
 
@@ -74,8 +78,9 @@ tools are the programs on this machine.
 
 ## Contributing
 
-`git config core.hooksPath .githooks` once; the hook keeps the tree free
-of private names, ASCII, and syntax-clean. `python3 tests/acp_pty.py`
+`git config core.hooksPath .githooks` once; the hooks keep the tree and
+the commit messages free of private names, the docs ASCII, the code
+syntax-clean. `python3 tests/acp_pty.py`
 drives spark-acp over pipes, as a client does, against a stub spark.
 Another app joins spark the same way this one does, in its own repo.
 

@@ -14,7 +14,15 @@
 # diffs + a delete call + one question -> accept / discard; session/cancel
 # while a question waits answers `quit`, and a spark that reads nothing
 # is stopped; one prompt at a time; a spark without --porcelain, or no
-# spark, is one clear error; stdout carries nothing but JSON-RPC.
+# spark, is one clear error; stdout carries nothing but JSON-RPC. And the
+# edges: the goal always after `--`; the review carries +x, the reason,
+# control characters and every git item, what is held back its own call
+# before the question; `stopped` and a refusal before the run end the
+# turn with spark's hint; a cancel before spark starts means it never
+# starts; a line over 8 MB stops spark; a review past 2 MB of diff shows
+# lines; a malformed message never ends the agent, and no spark outlives
+# it (stdin closed, or SIGTERM); a late answer finds its question gone;
+# sessions are bounded, the oldest idle one dropped.
 #
 #   python3 tests/acp_pty.py
 
@@ -46,6 +54,10 @@ def emit(**ev):
     sys.stdout.write(json.dumps(ev) + "\n")
     sys.stdout.flush()
 
+def entry(path, status, old=None, new=None, exec=False, reason="", control=False):
+    return {"path": path, "status": status, "old": old, "new": new,
+            "exec": exec, "reason": reason, "control": control}
+
 def wait():
     line = sys.stdin.readline()
     word = line.strip() if line else "EOF"
@@ -54,6 +66,7 @@ def wait():
 
 args = sys.argv[1:]
 if args[:2] == ["do", "-h"]:
+    time.sleep(float(os.environ.get("STUB_SLOW_H") or 0))
     print("spark do -- a task, step by step")
     if not os.environ.get("STUB_OLD"):
         print("  spark do --porcelain <words>   JSON Lines, for a program (contract 15)")
@@ -62,6 +75,9 @@ rec("argv", args)
 rec("cwd", os.getcwd())
 rec("pid", os.getpid())
 sandbox, goal = "--sandbox" in args, args[-1]
+if "refuseall" in goal:
+    emit(ev="end", reason="refused", hint="STUB-REFUSED-RUN the sandbox needs a project directory", rc=2)
+    sys.exit(2)
 if "crash" in goal:
     sys.stderr.write("spark do -- STUB-CRASH the sandbox needs a project directory\n")
     sys.exit(2)
@@ -88,14 +104,20 @@ elif "review" in goal:
     emit(ev="output", n=1, text="formatted 2 files\n")
     emit(ev="rc", n=1, rc=0)
     emit(ev="review", run="r1", files=[
-        {"path": "new.txt", "status": "added", "old": None, "new": "hello\n"},
-        {"path": "src/a.py", "status": "changed", "old": "x=1\n", "new": "x = 1\n"},
-        {"path": "old.txt", "status": "deleted", "old": "bye\n", "new": None},
-        {"path": "run.sh", "status": "mode", "old": "644", "new": "755"},
-        {"path": "lnk", "status": "link", "old": None, "new": "src/a.py"},
-        {"path": ".git/hooks/pre-commit", "status": "held", "old": None, "new": None},
-        {"path": "escape", "status": "refused", "old": None, "new": None},
-        {"path": "logo.png", "status": "binary", "old": None, "new": None}])
+        entry("new.txt", "added", None, "hello\n"),
+        entry("src/a.py", "changed", "x=1\n", "x = 1\n"),
+        entry("tool.sh", "added", None, "#!/bin/sh\n", exec=True),
+        entry("old.txt", "deleted", "bye\n", None),
+        entry("run.sh", "mode", "644", "755", exec=True),
+        entry("suid", "mode", "755", "755", reason="setuid masked"),
+        entry("lnk", "link", None, "src/a.py"),
+        entry(".git/hooks/pre-commit", "held", reason="a git hook -- never applied"),
+        entry(".git/config", "held", reason="git config -- never applied"),
+        entry(".git/info/exclude", "changed", "", "*.o\n"),
+        entry("escape", "refused", reason="a link out of the directory"),
+        entry("logo.png", "binary"),
+        entry("big.log", "added", reason="too large to show"),
+        entry("a^[[31m.txt", "added", None, "x\n", control=True)])
     word = wait()
     if word == "accept":
         emit(ev="note", text="STUB-APPLIED 5 changes")
@@ -104,6 +126,21 @@ elif "review" in goal:
         emit(ev="end", reason="done", hint="STUB-DISCARDED nothing changed", rc=0)
     else:
         emit(ev="end", reason="quit", hint="the run waits: spark do --review r1", rc=1)
+elif "bigdiff" in goal:
+    emit(ev="review", run="r1", files=[
+        entry("one.txt", "added", None, "a" * (1536 * 1024)),
+        entry("two.txt", "changed", "b", "c" * (1024 * 1024)),
+        entry("three.txt", "added", None, "d\n")])
+    wait()
+    emit(ev="end", reason="done", hint="discarded", rc=0)
+elif "stopped" in goal:
+    emit(ev="step", n=1, command="ls", hint="list", danger=False, proof=None)
+    wait()
+    emit(ev="end", reason="stopped", hint="STUB-STOPPED the same step again after a skip", rc=1)
+elif "longline" in goal:
+    sys.stdout.write('{"ev": "note", "text": "' + "x" * (9 * 1024 * 1024))
+    sys.stdout.flush()
+    time.sleep(60)
 elif "hang" in goal:
     emit(ev="step", n=1, command="sleep 1", hint="wait", danger=False, proof=None)
     if wait() == "quit":
@@ -165,6 +202,7 @@ class Agent:
             if msg.get("method") == "session/update":
                 updates.append(msg["params"])
             elif msg.get("method") == "session/request_permission":
+                msg["_at"] = len(updates)
                 asks.append(msg)
                 if on_ask:
                     on_ask(msg)
@@ -231,6 +269,16 @@ def main():
         def kinds(updates, kind):
             return [u["update"] for u in updates if u["update"].get("sessionUpdate") == kind]
 
+        def gone(pid, wait=5):
+            end = time.time() + wait
+            while time.time() < end:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    return True
+                time.sleep(0.1)
+            return False
+
         def said(updates):
             return "".join(u["content"]["text"] for u in kinds(updates, "agent_message_chunk"))
 
@@ -277,7 +325,7 @@ def main():
         rows = stub_log()
         ok(((r or {}).get("result") or {}).get("stopReason") == "end_turn", "plain: stopReason end_turn", r)
         argv = (of(rows, "argv") or [[]])[0]
-        ok(argv == ["do", "--porcelain", "plain: tidy the files"], "plain: argv is do --porcelain <goal>", argv)
+        ok(argv == ["do", "--porcelain", "--", "plain: tidy the files"], "plain: argv is do --porcelain -- <goal>", argv)
         ok(of(rows, "cwd") == [proj], "plain: spark runs in the session's cwd", of(rows, "cwd"))
         ok(of(rows, "stdin") == ["run", "skip", "run"], "plain: the answers reach stdin as run, skip, run",
            of(rows, "stdin"))
@@ -328,7 +376,7 @@ def main():
         rows = stub_log()
         ok(((r or {}).get("result") or {}).get("stopReason") == "end_turn", "review: stopReason end_turn")
         argv = (of(rows, "argv") or [[]])[0]
-        ok(argv == ["do", "--porcelain", "--sandbox", "review: format it"], "review: argv carries --sandbox", argv)
+        ok(argv == ["do", "--porcelain", "--sandbox", "--", "review: format it"], "review: argv carries --sandbox", argv)
         ok(of(rows, "stdin") == ["accept"], "review: steps are not asked; the review answers accept",
            of(rows, "stdin"))
         calls = kinds(up, "tool_call")
@@ -340,12 +388,28 @@ def main():
         diffs = [b for b in (edit[0]["content"] if edit else []) if b["type"] == "diff"]
         ok(diffs == [
             {"type": "diff", "path": os.path.join(proj, "new.txt"), "oldText": None, "newText": "hello\n"},
-            {"type": "diff", "path": os.path.join(proj, "src", "a.py"), "oldText": "x=1\n", "newText": "x = 1\n"}],
+            {"type": "diff", "path": os.path.join(proj, "src", "a.py"), "oldText": "x=1\n", "newText": "x = 1\n"},
+            {"type": "diff", "path": os.path.join(proj, "tool.sh"), "oldText": None, "newText": "#!/bin/sh\n"},
+            {"type": "diff", "path": os.path.join(proj, ".git", "info", "exclude"), "oldText": "", "newText": "*.o\n"},
+            {"type": "diff", "path": os.path.join(proj, "a^[[31m.txt"), "oldText": None, "newText": "x\n"}],
            "review: diffs with absolute paths, oldText null for a new file", diffs)
-        lines = json.dumps(edit[0]["content"] if edit else [])
-        ok(all(w in lines for w in ("held back .git/hooks/pre-commit", "refused   escape", "binary    logo.png",
-                                    "mode      run.sh  644 -> 755", "link      lnk -> src/a.py")),
-           "review: held, refused, binary, mode and link are text lines", lines)
+        text = "\n".join(b["content"]["text"] for b in (edit[0]["content"] if edit else []) if b["type"] == "content")
+        ok(all(w in text.splitlines() for w in ("binary    logo.png", "mode      run.sh  644 -> 755  +x",
+                                                "link      lnk -> src/a.py")),
+           "review: binary, mode and link are text lines", text)
+        ok(all(w in text.splitlines() for w in ("added     tool.sh  +x", "mode      suid  755 -> 755  (setuid masked)",
+                                                "added     big.log  (too large to show)",
+                                                "added     a^[[31m.txt  (control characters)")),
+           "review: +x, spark's reason and control characters are shown", text)
+        held = [c for c in calls if c["kind"] == "other"]
+        htext = held[0]["content"][0]["content"]["text"] if held else ""
+        ok(len(held) == 1 and held[0]["status"] == "failed" and htext.splitlines() == [
+            "held back .git/hooks/pre-commit  (a git hook -- never applied)",
+            "held back .git/config  (git config -- never applied)",
+            "refused   escape  (a link out of the directory)"],
+           "review: every held git item and the refused path, by name with the reason, in their own call", htext)
+        at = [i for i, u in enumerate(up) if held and u["update"].get("toolCallId") == held[0]["toolCallId"]]
+        ok(at and asks and at[0] < asks[0]["_at"], "review: the held call comes before the question")
         ok(dele and os.path.join(proj, "old.txt") in json.dumps(dele[0]["content"]),
            "review: the delete call lists the removed path")
         ok(len(asks) == 1 and asks[0]["params"]["options"] == [
@@ -385,8 +449,8 @@ def main():
         ok(of(rows, "stdin") == ["quit"], "cancel: spark reads quit", of(rows, "stdin"))
 
         # the cancel alone (a client that never answers the question)
-        r, up, asks = a.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "hang"}]},
-                             on_ask=lambda q: a.write({"method": "session/cancel", "params": {"sessionId": sid}}))
+        r, up, asks_alone = a.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "hang"}]},
+                                   on_ask=lambda q: a.write({"method": "session/cancel", "params": {"sessionId": sid}}))
         rows = stub_log()
         ok(((r or {}).get("result") or {}).get("stopReason") == "cancelled" and of(rows, "stdin") == ["quit"],
            "cancel: an unanswered question is taken as cancelled")
@@ -422,7 +486,7 @@ def main():
         a.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "-h plain"}]},
                answer=picks("skip", "skip", "skip"))
         argv = (of(stub_log(), "argv") or [[]])[0]
-        ok(argv[-1:] == [" -h plain"], "a goal that looks like a flag stays the goal", argv)
+        ok(argv[-2:] == ["--", "-h plain"], "a goal that looks like a flag stays the goal, after --", argv)
         r, up, _ = a.call("session/prompt", {"sessionId": sid, "prompt": [
             {"type": "text", "text": "crash"}, {"type": "resource_link", "name": "a", "uri": "file:///srv/x.txt"}]})
         argv = (of(stub_log(), "argv") or [[]])[0]
@@ -432,6 +496,75 @@ def main():
         r, _, _ = a.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "image", "data": "", "mimeType": "x"}]})
         ok(((r or {}).get("error") or {}).get("code") == -32602, "a prompt with no text is refused")
 
+        # -- stopped, a refusal before the run ----------------------------
+        r, up, _ = a.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "stopped"}]},
+                          answer=picks("skip"))
+        stub_log()
+        ok(((r or {}).get("result") or {}).get("stopReason") == "end_turn" and "STUB-STOPPED" in said(up),
+           "stopped: stopReason end_turn, spark's hint said", r)
+        r, up, _ = a.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "refuseall"}]})
+        stub_log()
+        ok(((r or {}).get("result") or {}).get("stopReason") == "end_turn" and "STUB-REFUSED-RUN" in said(up)
+           and not kinds(up, "tool_call"), "refused before the run: end_turn, the hint said, no tool call")
+
+        # -- a line over 8 MB: spark stopped, the prompt ends --------------
+        t0 = time.time()
+        r, up, _ = a.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "longline"}]})
+        pid = (of(stub_log(), "pid") or [0])[0]
+        ok(((r or {}).get("result") or {}).get("stopReason") == "end_turn" and "over 8 MB" in said(up)
+           and gone(pid) and time.time() - t0 < WAIT, "a line over 8 MB: spark stopped, the prompt ends saying so",
+           said(up)[-200:])
+
+        # -- a review past 2 MB of diff: the rest are lines ----------------
+        a.call("session/set_mode", {"sessionId": sid, "modeId": "sandbox"})
+        r, up, _ = a.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "bigdiff"}]},
+                          answer=picks("discard"))
+        stub_log()
+        a.call("session/set_mode", {"sessionId": sid, "modeId": "ask"})
+        edit = [c for c in kinds(up, "tool_call") if c["kind"] == "edit"]
+        cont = edit[0]["content"] if edit else []
+        shown = [os.path.basename(b["path"]) for b in cont if b["type"] == "diff"]
+        size = sum(len(b.get("oldText") or "") + len(b["newText"]) for b in cont if b["type"] == "diff")
+        ok(shown == ["one.txt", "three.txt"] and size <= 2 * 1024 * 1024
+           and "changed   two.txt  (too large to show)" in json.dumps(cont),
+           "a review past 2 MB of diff: the rest are lines, too large to show", shown)
+
+        # -- a late answer finds its question gone ---------------------------
+        late = [q["id"] for q in asks_alone]
+        a.write({"id": late[0] if late else "none", "result": {"outcome": {"outcome": "cancelled"}}})
+
+        # -- malformed messages: answered, never the end of the agent -------
+        r, _, _ = a.call("session/new", {"cwd": proj, "mcpServers": 5})
+        sid2 = ((r or {}).get("result") or {}).get("sessionId")
+        ok(sid2, "session/new: an mcpServers that is not a list is ignored")
+        a.next += 1
+        think = a.next
+        a.write({"id": think, "method": "session/prompt", "params": {"sessionId": sid2, "prompt": [
+            {"type": "text", "text": "think"}]}})
+        time.sleep(1)
+        codes = []
+        for raw, want in ((b"\xff\xfe\n", None), (b"[" * 100000 + b"\n", None), (b"[1, 2, 3]\n", None),
+                          (b'{"jsonrpc": "2.0", "id": [1], "method": "initialize", "params": {}}\n', None),
+                          (b'{"jsonrpc": "2.0", "id": 1.5, "method": "initialize", "params": {}}\n', None),
+                          (b'{"jsonrpc": "2.0", "id": "m1", "method": ["x"]}\n', "m1"),
+                          (b'{"jsonrpc": "2.0", "id": "m2", "method": "session/set_mode", '
+                           b'"params": {"sessionId": ["x"]}}\n', "m2"),
+                          (b'{"jsonrpc": "2.0", "id": "m3", "method": "session/prompt", "params": [1, 2]}\n', "m3"),
+                          (b'{"jsonrpc": "2.0", "id": "m4", "method": "session/cancel", '
+                           b'"params": {"sessionId": {"a": 1}}}\n', "m4")):
+            a.p.stdin.write(raw)
+            a.p.stdin.flush()
+            r, _, _ = a.until(want)
+            codes.append(((r or {}).get("error") or {}).get("code"))
+        # no answer: a response to no question, a notification with a bad session
+        a.write({"id": {"a": 1}, "result": {}})
+        a.write({"method": "session/cancel", "params": {"sessionId": [1]}})
+        ok(codes == [-32700, -32700, -32600, -32602, -32602, -32600, -32602, -32602, -32601],
+           "malformed messages: parse error, bad request, bad id, bad sessionId -- each answered", codes)
+        r, _, _ = a.call("initialize", {"protocolVersion": 1})
+        ok(((r or {}).get("result") or {}).get("protocolVersion") == 1, "malformed messages: the agent still answers")
+        pid = (of(stub_log(), "pid") or [0])[0]
+
         # -- the protocol's edges ----------------------------------------
         r, _, _ = a.call("session/load", {"sessionId": sid, "cwd": proj, "mcpServers": []})
         ok(((r or {}).get("error") or {}).get("code") == -32601, "session/load: method not found")
@@ -440,6 +573,10 @@ def main():
         r, _, _ = a.until(None)
         ok(((r or {}).get("error") or {}).get("code") == -32700, "a line that is not JSON: parse error")
         a.close()
+        ok(pid and gone(pid), "the client went away: its running spark is stopped, never orphaned")
+        with open(os.path.join(tmp, "stderr")) as f:
+            ok("an answer to no question (id %r)" % (late[0] if late else None) in f.read(),
+               "a cancelled question leaves the list: its late answer finds nothing")
         ok(not a.bad, "stdout carried nothing but JSON-RPC", a.bad[:3])
         time.sleep(0.5)
         ok(not os.path.exists(marker), "the offered MCP server was never started")
@@ -452,6 +589,42 @@ def main():
             msg = ((r or {}).get("error") or {}).get("message", "")
             ok(word in msg, "%s: initialize fails, saying so" % what, msg)
             b.close()
+
+        # -- a cancel before spark starts: spark never starts ----------------
+        c = Agent(env(STUB_SLOW_H="2"))    # the probe (do -h) takes 2 s
+        r, _, _ = c.call("session/new", {"cwd": proj, "mcpServers": []})
+        csid = ((r or {}).get("result") or {}).get("sessionId")
+        stub_log()
+        c.write({"id": 1, "method": "session/prompt", "params": {"sessionId": csid, "prompt": [
+            {"type": "text", "text": "plain"}]}})
+        c.write({"method": "session/cancel", "params": {"sessionId": csid}})
+        r, _, asks = c.until(1)
+        time.sleep(0.5)
+        ok(((r or {}).get("result") or {}).get("stopReason") == "cancelled" and not asks
+           and not of(stub_log(), "argv"), "a cancel before spark starts: cancelled, spark never runs", r)
+        c.close()
+
+        # -- sessions are bounded; SIGTERM stops the running spark ----------
+        k = Agent(env())
+        r, _, _ = k.call("session/new", {"cwd": proj, "mcpServers": []})
+        busy = ((r or {}).get("result") or {}).get("sessionId")
+        k.write({"id": "busy", "method": "session/prompt", "params": {"sessionId": busy, "prompt": [
+            {"type": "text", "text": "think"}]}})
+        time.sleep(1)
+        more = []
+        for _ in range(64):
+            r, _, _ = k.call("session/new", {"cwd": proj, "mcpServers": []})
+            more.append(((r or {}).get("result") or {}).get("sessionId"))
+        state = []
+        for s in (busy, more[0], more[1], more[-1]):
+            r, _, _ = k.call("session/set_mode", {"sessionId": s, "modeId": "ask"})
+            state.append("error" not in (r or {"error": 1}))
+        ok(all(more) and state == [True, False, True, True],
+           "sessions: past 64 the oldest idle one is dropped, a busy one kept", state)
+        pid = (of(stub_log(), "pid") or [0])[0]
+        k.p.terminate()
+        k.p.wait(10)
+        ok(pid and gone(pid), "SIGTERM on spark-acp: its running spark is stopped, never orphaned")
         errf.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

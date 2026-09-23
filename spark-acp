@@ -13,9 +13,12 @@
 #   sandbox   the commands run in a sandboxed copy of the directory; you
 #             accept or discard the changes once, at the end
 #
-# spark decides what is safe, never this file: a step that can destroy
-# data outside the sandbox is refused by spark itself (there is no `yes`
-# over a pipe). spark-acp starts nothing but spark: the MCP servers a
+# spark decides what is safe, never this file: outside the sandbox a
+# step that can destroy data (or whose effect cannot be read from its
+# line) is refused by spark itself -- there is no `yes` over a pipe;
+# inside the sandbox it runs in the copy, and the diff is the gate. An
+# Accept applies the changes (a client that approves by itself accepts
+# without you). spark-acp starts nothing but spark: the MCP servers a
 # client offers are ignored, never launched. It never speaks HTTP and
 # never imports spark; stdout carries ACP messages and nothing else.
 #
@@ -35,6 +38,9 @@ VERSION = "1.0.0"
 PROTOCOL = 1
 GRACE = 5                   # seconds a cancelled spark has to read `quit`
 OUT_MAX = 64 * 1024         # the output one tool call shows (its tail)
+LINE_MAX = 8 * 1024 * 1024  # the longest line spark may send; a longer one stops it
+DIFF_MAX = 2 * 1024 * 1024  # the diff text one review call carries; past it, a line
+SESSIONS_MAX = 64           # sessions kept; a new one past it drops the oldest idle
 NEED = ("spark-acp needs spark 1.47 or newer (spark do --porcelain) "
         "-- spark update")
 MISSING = ("spark-acp needs spark on this machine (or SPARK_BIN) "
@@ -49,7 +55,7 @@ RUN_SKIP = [{"optionId": "run", "name": "Run", "kind": "allow_once"},
 ACCEPT_DISCARD = [{"optionId": "accept", "name": "Accept", "kind": "allow_once"},
                   {"optionId": "discard", "name": "Discard", "kind": "reject_once"}]
 STOP = {"done": "end_turn", "cap": "max_turn_requests", "quit": "cancelled",
-        "refused": "end_turn", "error": "end_turn"}
+        "refused": "end_turn", "stopped": "end_turn", "error": "end_turn"}
 
 # stdout is the protocol: keep the real one, and send anything else that
 # prints (a stray print, a library warning) to stderr.
@@ -75,6 +81,11 @@ class RpcError(Exception):
     def __init__(self, code, message):
         Exception.__init__(self, message)
         self.code, self.message = code, message
+
+
+def good_id(rid):
+    """A JSON-RPC id this agent answers to: a string or an integer."""
+    return isinstance(rid, str) or (isinstance(rid, int) and not isinstance(rid, bool))
 
 
 # --- requests to the client (the permission questions) -------------------
@@ -108,9 +119,15 @@ class Client:
     def ask(self, p, method, params):
         send({"id": p.id, "method": method, "params": params})
 
-    def resolve(self, msg):
+    def forget(self, p):
+        """A question answered or cancelled leaves the list."""
         with self.lock:
-            p = self.waiting.pop(msg.get("id"), None)
+            self.waiting.pop(p.id, None)
+
+    def resolve(self, msg):
+        rid = msg.get("id")
+        with self.lock:
+            p = self.waiting.pop(rid, None) if isinstance(rid, str) else None
         if p is None:
             log("an answer to no question (id %r), ignored" % (msg.get("id"),))
         else:
@@ -136,16 +153,18 @@ def block(text):
 
 # --- spark ------------------------------------------------------------------
 
-_speaks = set()
+_spark = None                # a spark that speaks contract 15, once found
 
 
 def find_spark():
-    """(path, None) when this spark speaks contract 15, else (path, why)."""
+    """(path, None) when this spark speaks contract 15, else (path, why).
+    A spark found is kept: the probe runs once. Never called under a lock."""
+    global _spark
+    if _spark:
+        return _spark, None
     path = os.environ.get("SPARK_BIN") or shutil.which("spark")
     if not path:
         return None, MISSING
-    if path in _speaks:
-        return path, None
     try:
         p = subprocess.run([path, "do", "-h"], stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
@@ -153,17 +172,26 @@ def find_spark():
         return path, MISSING
     if b"--porcelain" not in p.stdout:
         return path, NEED
-    _speaks.add(path)
+    _spark = path
     return path, None
 
 
-def goal_arg(goal):
-    # spark do reads its own flags first: a goal that starts like a flag
-    # (or is the word help) would be read as one. A leading space keeps
-    # it the goal's words.
-    if goal.startswith("-") or goal.lower() in ("help",):
-        return " " + goal
-    return goal
+def marks_of(f):
+    """What spark knows of a changed file beyond its diff."""
+    marks = []
+    if f.get("exec") is True:
+        marks.append("+x")
+    reason = f.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        marks.append("(%s)" % reason.strip())
+    if f.get("control") is True:
+        marks.append("(control characters)")
+    return marks
+
+
+def line_of(status, what, marks):
+    label = {"held": "held back"}.get(status, status)
+    return "%-9s %s" % (label, what) + "".join("  " + m for m in marks)
 
 
 # --- a session and its turns ------------------------------------------------
@@ -196,8 +224,8 @@ class Session:
 class Turn:
     """One session/prompt: one `spark do --porcelain` from start to end."""
 
-    def __init__(self, session, spark, goal):
-        self.s, self.spark, self.goal = session, spark, goal
+    def __init__(self, session, goal):
+        self.s, self.goal = session, goal
         self.sandbox = session.mode == "sandbox"
         self.lock = threading.Lock()
         self.cancelled, self.pending, self.proc, self.timer = False, None, None, None
@@ -256,6 +284,7 @@ class Turn:
         CLIENT.ask(pend, "session/request_permission",
                    {"sessionId": self.s.id, "toolCall": fields, "options": options})
         pend.event.wait()
+        CLIENT.forget(pend)
         with self.lock:
             self.pending = None
         outcome = (pend.response or {}).get("result")
@@ -266,25 +295,33 @@ class Turn:
 
     # --- the run ----------------------------------------------------------
     def run(self):
-        argv = [self.spark, "do", "--porcelain"]
-        if self.sandbox:
-            argv.append("--sandbox")
-        argv.append(goal_arg(self.goal))
-        try:
-            self.proc = subprocess.Popen(argv, cwd=self.s.cwd, stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                         start_new_session=True)
-        except OSError as e:
-            say(self.s.id, "spark did not start: %s" % e)
-            return "end_turn"
+        spark, why = find_spark()
+        if why:
+            raise RpcError(-32603, why)
+        # `--`: whatever the goal's words, spark reads them as the goal
+        argv = [spark, "do", "--porcelain"] + (["--sandbox"] if self.sandbox else []) + ["--", self.goal]
+        with self.lock:             # a cancel comes before the child, or sees it
+            if self.cancelled:
+                return "cancelled"
+            try:
+                self.proc = subprocess.Popen(argv, cwd=self.s.cwd, stdin=subprocess.PIPE,
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             start_new_session=True)
+            except OSError as e:
+                say(self.s.id, "spark did not start: %s" % e)
+                return "end_turn"
         threading.Thread(target=self.pump_stderr, daemon=True).start()
-        if self.cancelled:          # a cancel that came before the child
-            self.tell("quit")
         end = None
-        for raw in self.proc.stdout:
+        while True:
+            raw = self.proc.stdout.readline(LINE_MAX)
+            if not raw:
+                break
+            if len(raw) >= LINE_MAX and not raw.endswith(b"\n"):
+                self.stop()
+                return self.finish(None, "spark sent a line over %d MB -- stopped" % (LINE_MAX >> 20))
             try:
                 ev = json.loads(raw.decode("utf-8", "replace"))
-            except ValueError:
+            except (ValueError, RecursionError):
                 log("not contract 15, ignored: %r" % raw[:120])
                 continue
             if not isinstance(ev, dict):
@@ -310,13 +347,13 @@ class Turn:
         return self.finish(end)
 
     def pump_stderr(self):
-        for raw in self.proc.stderr:
+        for raw in iter(lambda: self.proc.stderr.readline(LINE_MAX), b""):
             line = raw.decode("utf-8", "replace").rstrip("\n")
-            self.errs.append(line)
+            self.errs.append(line[:400])
             sys.stderr.write(line + "\n")
             sys.stderr.flush()
 
-    def finish(self, end):
+    def finish(self, end, why=None):
         self.close("failed")
         reason = (end or {}).get("reason")
         for cid in self.reviewed:   # applied only when spark says done
@@ -332,7 +369,9 @@ class Turn:
             self.stop()
         if self.timer:
             self.timer.cancel()
-        if end is None:
+        if why:
+            say(self.s.id, why)
+        elif end is None:
             if not self.cancelled:
                 tail = "\n".join(line for line in self.errs if line.strip())
                 say(self.s.id, "spark stopped without an answer" + (":\n\n" + tail if tail else "."))
@@ -347,8 +386,8 @@ class Turn:
         n, command = ev.get("n"), str(ev.get("command") or "")
         head = [str(ev.get("hint") or "")]
         if ev.get("danger"):
-            head.append("can destroy data" + ("" if self.sandbox else
-                        " -- outside the sandbox spark does not run it"))
+            head.append("can destroy data -- " + ("it runs in the copy; the diff is the gate"
+                        if self.sandbox else "spark refuses it outside the sandbox"))
         if ev.get("proof"):
             head.append("proof: %s" % ev["proof"])
         head = "\n".join(h for h in head if h)
@@ -403,49 +442,61 @@ class Turn:
 
     def review(self, ev):
         """The sandbox's changes: one edit call (the diffs, and a line for
-        what is not a diff), one delete call, then one question."""
-        diffs, lines, gone, where = [], [], [], []
-        for f in ev.get("files") or []:
+        what is not a diff), one delete call, one call for what spark holds
+        back or refuses (never applied), then one question."""
+        diffs, lines, gone, held, where, gone_at = [], [], [], [], [], []
+        room, n = DIFF_MAX, 0
+        files = ev.get("files")
+        for f in files if isinstance(files, list) else []:
             if not isinstance(f, dict):
                 continue
-            rel, st = str(f.get("path") or ""), f.get("status")
+            rel, st = str(f.get("path") or ""), str(f.get("status") or "changed")
             old, new = f.get("old"), f.get("new")
             path = os.path.normpath(os.path.join(self.s.cwd, rel))
-            if st == "added" and isinstance(new, str):
-                diffs.append({"type": "diff", "path": path, "oldText": None, "newText": new})
-            elif st == "changed" and isinstance(old, str) and isinstance(new, str):
-                diffs.append({"type": "diff", "path": path, "oldText": old, "newText": new})
-            elif st == "deleted":
-                gone.append(path)
+            marks = marks_of(f)
+            if st in ("held", "refused"):
+                held.append(line_of(st, rel, marks or ["(never applied)"]))
                 continue
-            elif st == "mode":
-                lines.append("mode      %s  %s -> %s" % (rel, old, new))
-            elif st == "link":
-                lines.append("link      %s -> %s" % (rel, new))
-            elif st == "held":
-                lines.append("held back %s  (never applied)" % rel)
-            elif st == "refused":
-                lines.append("refused   %s" % rel)
-            elif st == "binary":
-                lines.append("binary    %s" % rel)
-            else:
-                lines.append("%-9s %s" % (st or "changed", rel))
+            n += 1
+            if st == "deleted":
+                gone.append(path + "".join("  " + m for m in marks))
+                gone_at.append({"path": path})
+                continue
             where.append({"path": path})
+            if isinstance(new, str) and (st == "added" or (st == "changed" and isinstance(old, str))):
+                old = old if st == "changed" else None
+                size = len(new) + len(old or "")
+                if size <= room:
+                    room -= size
+                    diffs.append({"type": "diff", "path": path, "oldText": old, "newText": new})
+                    if marks:
+                        lines.append(line_of(st, rel, marks))
+                    continue
+                marks.append("(too large to show)")
+            if st == "mode":
+                marks.insert(0, "%s -> %s" % (old, new))
+            elif st == "link":
+                rel = "%s -> %s" % (rel, new)
+            lines.append(line_of(st, rel, marks))
+        run = ev.get("run")
         content = diffs + ([block("\n".join(lines))] if lines else [])
-        n = len(diffs) + len(lines) + len(gone)
         cid = "%s-review" % self.tag
         fields = {"toolCallId": cid, "kind": "edit", "status": "pending",
                   "title": "the sandbox's changes: %d" % n, "content": content,
-                  "locations": where, "rawInput": {"run": ev.get("run")}}
+                  "locations": where, "rawInput": {"run": run}}
         update(self.s.id, sessionUpdate="tool_call", **fields)
         self.reviewed = [cid]
         if gone:
             did = "%s-delete" % self.tag
             update(self.s.id, sessionUpdate="tool_call", toolCallId=did, kind="delete",
                    status="pending", title="delete %d file%s" % (len(gone), "" if len(gone) == 1 else "s"),
-                   content=[block("\n".join(gone))], locations=[{"path": p} for p in gone],
-                   rawInput={"run": ev.get("run")})
+                   content=[block("\n".join(gone))], locations=gone_at, rawInput={"run": run})
             self.reviewed.append(did)
+        if held:
+            # shown before the question: what an Accept will not apply
+            update(self.s.id, sessionUpdate="tool_call", toolCallId="%s-held" % self.tag, kind="other",
+                   status="failed", title="held back, never applied: %d" % len(held),
+                   content=[block("\n".join(held))], rawInput={"run": run})
         choice = self.ask(fields, ACCEPT_DISCARD)
         if choice == "accept":
             self.tell("accept")
@@ -462,13 +513,17 @@ class Turn:
 
 # --- the methods ------------------------------------------------------------
 
-SESSIONS = {}
+SESSIONS = {}                   # oldest first; a session used moves to the end
 
 
 def session_of(params):
-    s = SESSIONS.get(params.get("sessionId"))
+    sid = params.get("sessionId")
+    if not isinstance(sid, str):
+        raise RpcError(-32602, "sessionId must be a string")
+    s = SESSIONS.pop(sid, None)
     if s is None:
         raise RpcError(-32602, "no such session")
+    SESSIONS[sid] = s
     return s
 
 
@@ -491,11 +546,16 @@ def m_session_new(params):
     cwd = params.get("cwd")
     if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
         raise RpcError(-32602, "cwd must be the absolute path of a directory")
-    servers = params.get("mcpServers") or []
-    if servers:
+    servers = params.get("mcpServers")
+    if isinstance(servers, list) and servers:
         # spark's tools are the programs on this machine: an MCP server a
         # client offers is never started, whatever its command says.
         log("%d MCP server(s) offered, ignored: spark-acp starts none" % len(servers))
+    if len(SESSIONS) >= SESSIONS_MAX:
+        idle = next((k for k, v in SESSIONS.items() if v.turn is None), None)
+        if idle is None:
+            raise RpcError(-32603, "%d sessions are running a prompt: end one first" % SESSIONS_MAX)
+        del SESSIONS[idle]
     s = Session(cwd)
     SESSIONS[s.id] = s
     return {"sessionId": s.id, "modes": s.modes(), "configOptions": s.config()}
@@ -503,7 +563,7 @@ def m_session_new(params):
 
 def set_mode(s, mode):
     if mode not in [m[0] for m in MODES]:
-        raise RpcError(-32602, "no such mode: %r (ask, sandbox)" % (mode,))
+        raise RpcError(-32602, "no such mode (ask, sandbox)")
     s.mode = mode                   # the next prompt runs this way
 
 
@@ -515,7 +575,7 @@ def m_set_mode(params):
 def m_set_config_option(params):
     s = session_of(params)
     if params.get("configId") != "mode":
-        raise RpcError(-32602, "no such option: %r (mode)" % (params.get("configId"),))
+        raise RpcError(-32602, "no such option (mode)")
     set_mode(s, params.get("value"))
     return {"configOptions": s.config()}
 
@@ -548,29 +608,28 @@ def m_prompt(params, rid):
             raise RpcError(-32600, "this session is still running a prompt: one at a time")
         if not goal:
             raise RpcError(-32602, "say what to do: the prompt has no text")
-        spark, why = find_spark()
-        if why:
-            raise RpcError(-32603, why)
-        s.turn = Turn(s, spark, goal)
-    threading.Thread(target=run_turn, args=(s, rid), daemon=True).start()
+        turn = s.turn = Turn(s, goal)
+    threading.Thread(target=run_turn, args=(s, turn, rid), daemon=True).start()
 
 
-def run_turn(s, rid):
-    turn = s.turn
+def run_turn(s, turn, rid):
     try:
-        stop = turn.run()
+        reply = {"result": {"stopReason": turn.run()}}
+    except RpcError as e:           # no spark to run: the prompt's error
+        reply = {"error": {"code": e.code, "message": e.message}}
     except Exception as e:          # a bug here must still end the turn
         log("the turn failed: %r" % e)
         say(s.id, "spark-acp failed: %s" % e)
         turn.stop()
-        stop = "cancelled" if turn.cancelled else "end_turn"
+        reply = {"result": {"stopReason": "cancelled" if turn.cancelled else "end_turn"}}
     with s.lock:
         s.turn = None
-    send({"id": rid, "result": {"stopReason": stop}})
+    send(dict(reply, id=rid))
 
 
 def m_cancel(params):
-    s = SESSIONS.get(params.get("sessionId"))
+    sid = params.get("sessionId")
+    s = SESSIONS.get(sid) if isinstance(sid, str) else None
     if s:
         s.cancel()
 
@@ -580,28 +639,57 @@ METHODS = {"initialize": m_initialize, "session/new": m_session_new,
 
 
 def dispatch(msg):
+    rid = msg.get("id") if isinstance(msg, dict) else None
+    rid = rid if good_id(rid) else None
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
-        send({"id": msg.get("id") if isinstance(msg, dict) else None,
-              "error": {"code": -32600, "message": "not a JSON-RPC 2.0 message"}})
+        send({"id": rid, "error": {"code": -32600, "message": "not a JSON-RPC 2.0 message"}})
         return
-    method, rid = msg.get("method"), msg.get("id")
+    method = msg.get("method")
     if method is None:
         CLIENT.resolve(msg)         # an answer to one of our questions
+        return
+    if not isinstance(method, str):
+        if "id" in msg:
+            send({"id": rid, "error": {"code": -32600, "message": "method must be a string"}})
         return
     params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
     if "id" not in msg:             # a notification: never answered
         if method == "session/cancel":
             m_cancel(params)
         return
+    if rid is None:
+        send({"id": None, "error": {"code": -32602, "message": "id must be a string or an integer"}})
+        return
     try:
         if method == "session/prompt":
             m_prompt(params, rid)   # answered by its turn, when spark ends
             return
         if method not in METHODS:
-            raise RpcError(-32601, "method not found: %s" % method)
+            raise RpcError(-32601, "method not found: %s" % method[:80])
         send({"id": rid, "result": METHODS[method](params)})
     except RpcError as e:
         send({"id": rid, "error": {"code": e.code, "message": e.message}})
+
+
+def serve():
+    for raw in sys.stdin.buffer:
+        if not raw.strip():
+            continue
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, RecursionError):    # not UTF-8, not JSON, too deep
+            send({"id": None, "error": {"code": -32700, "message": "parse error"}})
+            continue
+        try:
+            dispatch(msg)
+        except Exception as e:      # a bug answers the message, never ends the agent
+            log("a message failed: %r" % e)
+            if isinstance(msg, dict) and msg.get("method") is not None and good_id(msg.get("id")):
+                send({"id": msg["id"], "error": {"code": -32603, "message": "internal error"}})
+
+
+def leave(signum, frame):
+    raise SystemExit(128 + signum)  # the finally in main still stops spark
 
 
 def main(argv):
@@ -614,19 +702,18 @@ def main(argv):
                       "Needs spark 1.47 or newer (spark do --porcelain).\n")).encode("ascii"))
         OUT.flush()
         return 0
-    for raw in sys.stdin.buffer:
-        if not raw.strip():
-            continue
-        try:
-            msg = json.loads(raw.decode("utf-8"))
-        except ValueError:
-            send({"id": None, "error": {"code": -32700, "message": "parse error"}})
-            continue
-        dispatch(msg)
-    # the client went away: stop what still runs
-    for s in list(SESSIONS.values()):
-        if s.turn:
-            s.turn.stop()
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, leave)
+    try:
+        serve()
+    finally:
+        # the client went away, or this file failed: stop what still runs
+        for s in list(SESSIONS.values()):
+            turn = s.turn
+            if turn:
+                with turn.lock:     # a spark about to start never starts
+                    turn.cancelled = True
+                turn.stop()
     return 0
 
 

@@ -39,7 +39,7 @@ fi
 # --- 2. syntax ------------------------------------------------------------
 python3 -m py_compile tests/*.py || bad "python syntax"
 python3 -m py_compile spark-acp || bad "spark-acp: python syntax"
-sh -n .githooks/pre-commit || bad "sh syntax"
+sh -n .githooks/pre-commit .githooks/commit-msg || bad "sh syntax"
 
 # --- 3. docs stay ASCII (read in the editor's help pane, and on a console)
 tab=$(printf '\t')
