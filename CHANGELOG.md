@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0
+
+- A step of several lines (spark 1.70: a here-document that writes a
+  file) is titled by its first line and its line count, and the whole
+  step rides in the tool call's content as a code block, every line,
+  before the question. A client draws a title on one line, so the
+  lines after the first were not shown before.
+
 ## 1.0.0
 
 - spark do in an ACP client (the Agent Client Protocol, version 1):

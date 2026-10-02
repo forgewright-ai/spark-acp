@@ -133,6 +133,12 @@ elif "bigdiff" in goal:
         entry("three.txt", "added", None, "d\n")])
     wait()
     emit(ev="end", reason="done", hint="discarded", rc=0)
+elif "blockstep" in goal:                  # a step of several lines (spark 1.70)
+    emit(ev="step", n=1, command="cat > s.sh <<'EOF'\necho hi\nEOF\nsh s.sh", hint="write and run", danger=False,
+         proof=None, lines=4)
+    if wait() == "run":
+        emit(ev="rc", n=1, rc=0)
+    emit(ev="end", reason="done", hint="done", rc=0)
 elif "stopped" in goal:
     emit(ev="step", n=1, command="ls", hint="list", danger=False, proof=None)
     wait()
@@ -317,6 +323,19 @@ def main():
         for bad, why in (("relative/dir", "a relative cwd"), (os.path.join(proj, "nope"), "a missing cwd")):
             r, _, _ = a.call("session/new", {"cwd": bad, "mcpServers": []})
             ok(((r or {}).get("error") or {}).get("code") == -32602, "session/new: %s is refused" % why)
+
+        # -- a step of several lines: titled by its head, shown whole -----
+        stub_log()
+        r, up, asks = a.call("session/prompt", {"sessionId": sid, "prompt": [
+            {"type": "text", "text": "blockstep: write a script"}]}, answer=picks("run"))
+        calls = kinds(up, "tool_call")
+        texts = [c2.get("content", {}).get("text", "") for c2 in (calls[0].get("content") or [])] if calls else []
+        ok(calls and calls[0]["title"] == "cat > s.sh <<'EOF'   (4 lines)",
+           "block: the title is the first line and the count", calls[:1])
+        ok(texts and texts[0] == "```sh\ncat > s.sh <<'EOF'\necho hi\nEOF\nsh s.sh\n```",
+           "block: every line rides in the call's content before the question", texts)
+        ok(calls and calls[0].get("rawInput") == {"command": "cat > s.sh <<'EOF'\necho hi\nEOF\nsh s.sh"},
+           "block: rawInput holds the whole block", calls[:1])
 
         # -- a plain run: run, skip, a failing step ----------------------
         stub_log()

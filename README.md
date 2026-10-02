@@ -24,6 +24,10 @@ the copy, and the diff is the gate: nothing reaches the directory until
 Accept, and Accept applies the changes. A client set to approve on its
 own answers Run and Accept without you.
 
+A command of several lines -- spark 1.70 writes a file with a
+here-document -- is titled by its first line and its line count, and
+shown whole in the call, every line, before you choose.
+
 ## Install
 
 You need spark 1.47 or newer (`spark do -h` names `--porcelain`) and
